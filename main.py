@@ -152,6 +152,8 @@ class HidenCloudBot:
         self.services = []
         # 跨服务去重集合，避免对同一张账单反复尝试支付
         self.processed_invoices = set()
+        # 本轮运行中已确认当前页面不可支付的账单，避免每个服务重复打开
+        self.non_payable_invoices = set()
 
         cached_data = CacheManager.load()
         cached_cookie = cached_data.get(str(index))
@@ -262,8 +264,45 @@ class HidenCloudBot:
     def normalize_url(self, url):
         return urljoin(self.base_url, url)
 
-    def extract_invoice_links(self, soup):
+    def has_invoice_payment_context(self, text):
+        normalized = re.sub(r'\s+', ' ', text or '').strip().lower()
+        if not normalized:
+            return False
+
+        positive_keywords = [
+            'unpaid', 'pending', 'pay now', 'payment due',
+            '未支付', '待支付', '待付款', '立即支付', '去支付', '付款', '支付'
+        ]
+        negative_keywords = [
+            'paid', 'completed', 'cancelled', 'canceled', 'refunded',
+            '已支付', '已付款', '已完成', '已取消', '已退款', '作废'
+        ]
+
+        has_positive = any(keyword in normalized for keyword in positive_keywords)
+        has_negative = any(keyword in normalized for keyword in negative_keywords)
+        return has_positive and not has_negative
+
+    def extract_invoice_links(self, soup, require_payment_context=False):
         invoice_links = []
+
+        if require_payment_context:
+            containers = soup.find_all(['tr', 'li', 'div', 'article', 'section'])
+            for container in containers:
+                links = []
+                for a in container.find_all('a', href=True):
+                    href = a['href']
+                    if '/invoice/' in href and 'download' not in href:
+                        links.append(self.normalize_url(href))
+
+                if not links:
+                    continue
+
+                container_text = container.get_text(" ", strip=True)
+                if self.has_invoice_payment_context(container_text):
+                    invoice_links.extend(links)
+
+            return sorted(set(invoice_links))
+
         for a in soup.find_all('a', href=True):
             href = a['href']
             if '/invoice/' in href and 'download' not in href:
@@ -353,7 +392,7 @@ class HidenCloudBot:
             return True
 
         soup_resp = BeautifulSoup(response.text, 'html.parser')
-        invoice_links = self.extract_invoice_links(soup_resp)
+        invoice_links = self.extract_invoice_links(soup_resp, require_payment_context=False)
         if invoice_links:
             invoice_url = invoice_links[0]
             self.log(f"🔗 在响应HTML中发现账单链接: {invoice_url}")
@@ -477,11 +516,12 @@ class HidenCloudBot:
             try:
                 res = self.request('GET', f"/service/{service_id}/invoices?where=unpaid")
                 soup = BeautifulSoup(res.text, 'html.parser')
-                invoice_links = self.extract_invoice_links(soup)
+                invoice_links = self.extract_invoice_links(soup, require_payment_context=True)
 
                 # 过滤掉本次运行中已处理过的账单，避免重复操作
                 unique_invoices = [url for url in set(invoice_links)
-                                   if url not in self.processed_invoices]
+                                   if url not in self.processed_invoices
+                                   and url not in self.non_payable_invoices]
 
                 if not unique_invoices:
                     if retries > 1 and attempt < retries - 1:
@@ -516,6 +556,9 @@ class HidenCloudBot:
         if normalized_current_url in self.processed_invoices:
             self.log(f"⏭️ 账单已处理，跳过重复支付: {normalized_current_url}")
             return
+        if normalized_current_url in self.non_payable_invoices:
+            self.log(f"⏭️ 账单当前不可支付，跳过重复检查: {normalized_current_url}")
+            return
 
         soup = BeautifulSoup(html_content, 'html.parser')
         self._refresh_csrf(soup)
@@ -546,7 +589,13 @@ class HidenCloudBot:
                         break
 
         if not target_form:
-            self.log("⚠️ 未找到可用的支付表单，可能账单已支付或页面结构变更")
+            page_title = soup.title.string.strip() if soup.title and soup.title.string else "无标题"
+            page_text = soup.get_text(" ", strip=True)
+            if not self.has_invoice_payment_context(page_text):
+                self.non_payable_invoices.add(normalized_current_url)
+                self.log(f"⚪ 账单页面未显示未支付/支付入口，视为本轮不可支付并跳过: {normalized_current_url}")
+            else:
+                self.log(f"⚠️ 未找到可用的支付表单，可能页面结构变更。标题: {page_title}")
             return
 
         payload = {}
